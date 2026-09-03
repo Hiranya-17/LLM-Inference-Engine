@@ -1,0 +1,4 @@
+ml_dtypes==0.5.4
+numpy==2.0.2
+pytest==8.4.2
+safetensors==0.7.0

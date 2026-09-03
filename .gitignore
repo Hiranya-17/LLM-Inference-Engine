@@ -1,0 +1,7 @@
+.venv/
+models/
+bench/results.jsonl
+__pycache__/
+*.pyc
+.pytest_cache/
+scratch/
