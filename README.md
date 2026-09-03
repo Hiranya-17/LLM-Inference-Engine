@@ -19,7 +19,7 @@ Each phase is built and independently verified for correctness before the next o
 ## Status
 
 - [x] Phase 1 — Safetensors parsing
-- [ ] Phase 2 — BPE tokenization
+- [x] Phase 2 — BPE tokenization
 - [ ] Phase 3 — Naive forward pass
 - [ ] Phase 4 — KV cache
 - [ ] Phase 5 — Sampling
@@ -30,6 +30,12 @@ Each phase is built and independently verified for correctness before the next o
 [`src/safetensors_reader.py`](src/safetensors_reader.py) implements the `.safetensors` format from the byte layout up: an 8-byte header length, a JSON header describing each tensor's name/dtype/shape/byte-offsets, followed by the raw tensor data. Includes a from-scratch BF16→FP32 upcast (bit-shifting, no floating point math) since NumPy has no native bfloat16 type.
 
 Verified in [`tests/test_phase1_safetensors.py`](tests/test_phase1_safetensors.py) against the `safetensors` + `ml_dtypes` packages, used strictly as an independent reference oracle (never imported by the actual implementation): tensor names, shapes/dtypes, full byte-range coverage of the data blob, bit-exact BF16 upcast, and structural sanity against the model's `config.json`.
+
+### Phase 2: BPE tokenization
+
+[`src/bpe_tokenizer.py`](src/bpe_tokenizer.py) implements Qwen2.5's byte-level BPE tokenizer from `tokenizer.json`'s raw contents: the GPT-2-style byte↔unicode remapping table, the regex-based pretokenizer, the iterative byte-pair merge loop, and both `encode()`/`decode()`. No `tokenizers` or `transformers` library in the actual implementation.
+
+Verified in [`tests/test_phase2_tokenizer.py`](tests/test_phase2_tokenizer.py) against the standalone `tokenizers` package (not `transformers`), used strictly as a reference oracle: 10,000 generated strings (English sentences, numbers, unicode/emoji, code snippets, whitespace edge cases, random punctuation) all produce token ids identical to the reference, and all round-trip through `decode()` back to the original text exactly.
 
 ## Setup
 

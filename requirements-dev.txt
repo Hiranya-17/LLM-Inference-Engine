@@ -1,4 +1,6 @@
 ml_dtypes==0.5.4
 numpy==2.0.2
 pytest==8.4.2
+regex==2026.1.15
 safetensors==0.7.0
+tokenizers==0.22.2
