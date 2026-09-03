@@ -1,6 +1,9 @@
+huggingface_hub==0.36.2
 ml_dtypes==0.5.4
 numpy==2.0.2
 pytest==8.4.2
 regex==2026.1.15
 safetensors==0.7.0
 tokenizers==0.22.2
+torch==2.8.0
+transformers==4.57.6

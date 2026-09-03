@@ -20,7 +20,7 @@ Each phase is built and independently verified for correctness before the next o
 
 - [x] Phase 1 — Safetensors parsing
 - [x] Phase 2 — BPE tokenization
-- [ ] Phase 3 — Naive forward pass
+- [x] Phase 3 — Naive forward pass
 - [ ] Phase 4 — KV cache
 - [ ] Phase 5 — Sampling
 - [ ] Phase 6 — Quantization
@@ -36,6 +36,12 @@ Verified in [`tests/test_phase1_safetensors.py`](tests/test_phase1_safetensors.p
 [`src/bpe_tokenizer.py`](src/bpe_tokenizer.py) implements Qwen2.5's byte-level BPE tokenizer from `tokenizer.json`'s raw contents: the GPT-2-style byte↔unicode remapping table, the regex-based pretokenizer, the iterative byte-pair merge loop, and both `encode()`/`decode()`. No `tokenizers` or `transformers` library in the actual implementation.
 
 Verified in [`tests/test_phase2_tokenizer.py`](tests/test_phase2_tokenizer.py) against the standalone `tokenizers` package (not `transformers`), used strictly as a reference oracle: 10,000 generated strings (English sentences, numbers, unicode/emoji, code snippets, whitespace edge cases, random punctuation) all produce token ids identical to the reference, and all round-trip through `decode()` back to the original text exactly.
+
+### Phase 3: Naive forward pass
+
+[`src/forward_pass.py`](src/forward_pass.py) implements Qwen2.5's full transformer forward pass in NumPy: token embedding lookup, RMSNorm, rotary position embeddings (RoPE), grouped-query attention (14 query heads sharing 2 key/value heads) with causal masking, and a SwiGLU MLP block — 24 layers, each wrapped in residual connections, followed by a final norm and a tied-embedding output projection. No `torch` or `transformers` in the actual implementation.
+
+Verified in [`tests/test_phase3_forward_pass.py`](tests/test_phase3_forward_pass.py) against `torch`+`transformers` (CPU, float32), used strictly as a reference oracle — prompts are tokenized with this project's own phase 2 tokenizer, and the reference is only used to compute ground-truth logits for those exact token ids. Across 3 test prompts: every one of the 24 layers' hidden states matches the reference, final logits match within `1e-3`, and the actual greedy-decoded next token agrees exactly.
 
 ## Setup
 
