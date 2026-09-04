@@ -22,7 +22,7 @@ Each phase is built and independently verified for correctness before the next o
 - [x] Phase 2 — BPE tokenization
 - [x] Phase 3 — Naive forward pass
 - [x] Phase 4 — KV cache
-- [ ] Phase 5 — Sampling
+- [x] Phase 5 — Sampling
 - [ ] Phase 6 — Quantization
 
 ### Phase 1: Safetensors parsing
@@ -50,6 +50,12 @@ Verified in [`tests/test_phase3_forward_pass.py`](tests/test_phase3_forward_pass
 Verified in [`tests/test_phase4_kv_cache.py`](tests/test_phase4_kv_cache.py) against this project's own uncached phase 3/4 baseline (`generate_naive`) — no external reference needed, per the original spec. Across 2 prompts, `generate_with_cache` produces **token-for-token identical** output to `generate_naive`.
 
 **Honest speedup number:** only ~1.1-1.2x at these scales (generating 10-40 tokens on a 0.5B model), not the large speedup a KV cache implies in principle. The cache is doing genuinely less work — confirmed by the speedup direction trending up as sequence length grows — but at such short sequences, wall-clock time here is dominated by fixed Python/NumPy overhead (a `for` loop over 14 attention heads and dict lookups by string key for every weight tensor, per layer, per token) rather than by the O(n²)-vs-O(n) algorithmic difference the cache actually fixes. That gap would widen substantially at longer sequences or with a vectorized (rather than per-head Python loop) implementation — out of scope for this phase, which asked for correctness plus a measurement, not an optimized implementation.
+
+### Phase 5: Sampling
+
+[`src/sampling.py`](src/sampling.py) implements temperature scaling, top-k filtering, top-p (nucleus) filtering, softmax, and a full sampling pipeline (`sample()`) that chains them together and draws a token id from a seedable `numpy.random.Generator`. Top-k and top-p both work by setting excluded logits to `-inf` (so they get probability 0 after softmax) rather than by removing entries — this keeps every function's output the same shape as its input, which is what lets them chain: `apply_temperature` → `top_k_filter` → `top_p_filter` → `softmax` → sample.
+
+Verified in [`tests/test_phase5_sampling.py`](tests/test_phase5_sampling.py): `apply_temperature`, `top_k_filter`, and `top_p_filter` are each checked against `transformers`' own `TemperatureLogitsWarper`/`TopKLogitsWarper`/`TopPLogitsWarper` classes (used strictly as a reference oracle, never imported by the actual implementation) across multiple parameter values. `softmax` is checked against `torch.softmax`. Since the actual random draw can't be checked against a reference the same way (independent RNGs draw different random numbers even from identical probabilities), `sample()` is instead verified statistically — 100,000 draws from a known 5-element distribution match the expected probabilities within `0.01` — and for reproducibility: the same seed produces the exact same sequence of draws, and `top_k=1` always agrees with greedy argmax regardless of seed.
 
 ## Setup
 
