@@ -21,7 +21,7 @@ Each phase is built and independently verified for correctness before the next o
 - [x] Phase 1 — Safetensors parsing
 - [x] Phase 2 — BPE tokenization
 - [x] Phase 3 — Naive forward pass
-- [ ] Phase 4 — KV cache
+- [x] Phase 4 — KV cache
 - [ ] Phase 5 — Sampling
 - [ ] Phase 6 — Quantization
 
@@ -42,6 +42,14 @@ Verified in [`tests/test_phase2_tokenizer.py`](tests/test_phase2_tokenizer.py) a
 [`src/forward_pass.py`](src/forward_pass.py) implements Qwen2.5's full transformer forward pass in NumPy: token embedding lookup, RMSNorm, rotary position embeddings (RoPE), grouped-query attention (14 query heads sharing 2 key/value heads) with causal masking, and a SwiGLU MLP block — 24 layers, each wrapped in residual connections, followed by a final norm and a tied-embedding output projection. No `torch` or `transformers` in the actual implementation.
 
 Verified in [`tests/test_phase3_forward_pass.py`](tests/test_phase3_forward_pass.py) against `torch`+`transformers` (CPU, float32), used strictly as a reference oracle — prompts are tokenized with this project's own phase 2 tokenizer, and the reference is only used to compute ground-truth logits for those exact token ids. Across 3 test prompts: every one of the 24 layers' hidden states matches the reference, final logits match within `1e-3`, and the actual greedy-decoded next token agrees exactly.
+
+### Phase 4: KV cache
+
+[`src/kv_cache.py`](src/kv_cache.py) adds key/value caching on top of phase 3: instead of recomputing K/V for the entire growing sequence on every generation step, each layer caches every position's K/V and only computes it once, for the new token(s). One masking rule (query position `i` may attend to key position `j` whenever `j <= i`, using absolute sequence positions) handles both the initial full-prompt "prefill" and later single-token "decode" steps without special-casing either.
+
+Verified in [`tests/test_phase4_kv_cache.py`](tests/test_phase4_kv_cache.py) against this project's own uncached phase 3/4 baseline (`generate_naive`) — no external reference needed, per the original spec. Across 2 prompts, `generate_with_cache` produces **token-for-token identical** output to `generate_naive`.
+
+**Honest speedup number:** only ~1.1-1.2x at these scales (generating 10-40 tokens on a 0.5B model), not the large speedup a KV cache implies in principle. The cache is doing genuinely less work — confirmed by the speedup direction trending up as sequence length grows — but at such short sequences, wall-clock time here is dominated by fixed Python/NumPy overhead (a `for` loop over 14 attention heads and dict lookups by string key for every weight tensor, per layer, per token) rather than by the O(n²)-vs-O(n) algorithmic difference the cache actually fixes. That gap would widen substantially at longer sequences or with a vectorized (rather than per-head Python loop) implementation — out of scope for this phase, which asked for correctness plus a measurement, not an optimized implementation.
 
 ## Setup
 
