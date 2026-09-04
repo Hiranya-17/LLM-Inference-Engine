@@ -1,6 +1,7 @@
 """
-INT8 and INT4 quantization (per-tensor), with perplexity measured at each
-precision level.
+INT8 and INT4 quantization - both per-tensor (one scale for the whole
+matrix) and per-row (one scale per output neuron) - with perplexity
+measured at each precision level and granularity.
 
 No `torch` or `transformers` here - those are reference-oracle-only, used in
 tests/, never in this file.
@@ -21,6 +22,14 @@ integers, we pick ONE scale factor per tensor:
 Every value in the tensor now shares the same scale, so quantizing loses
 precision (many nearby float values collapse to the same integer) but
 keeps the tensor roughly the same shape and range.
+
+--- Per-row: a smaller blast radius for outliers ---
+A single scale per tensor means one unusually large weight anywhere in the
+matrix forces the scale up for EVERY value in it, crushing all the normal-
+sized weights toward zero. Per-row quantization computes one scale per row
+instead (each row = one output neuron's weights) - an outlier in one row
+only hurts that row's own precision, leaving every other row's scale
+tight and accurate.
 
 --- "Fake" quantization ---
 This project measures the ACCURACY impact of quantization, not the storage
@@ -102,6 +111,64 @@ def quantize_weights(weights: dict, num_bits: int) -> dict:
         if tensor.ndim == 2:
             quantized, scale = quantize_tensor(tensor, num_bits)
             result[name] = dequantize_tensor(quantized, scale)
+        else:
+            result[name] = tensor
+    return result
+
+
+def quantize_tensor_per_row(tensor: np.ndarray, num_bits: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Like quantize_tensor, but with one scale PER ROW instead of one scale
+    for the whole tensor. Each weight matrix here is shaped
+    (out_features, in_features) - one row per output neuron - so a per-row
+    scale means one outlier weight only stretches its own row's scale,
+    instead of dragging the scale (and therefore the precision) of every
+    other row in the tensor down with it.
+
+    qmax = 2^(num_bits - 1) - 1
+    row_max = max(abs(tensor)) along each row (axis=1), keeping the
+              dimension so it still broadcasts against the full tensor:
+              np.abs(tensor).max(axis=1, keepdims=True)
+    scale = row_max / qmax                      (shape: (num_rows, 1))
+    quantized = round(tensor / scale), clipped to [-qmax, qmax], as int8
+
+    tensor: 2D, shape (num_rows, num_cols)
+    num_bits: 8 or 4
+    Returns: (quantized, scale) - quantized is the same shape as tensor,
+             dtype int8; scale has shape (num_rows, 1), one value per row.
+    """
+    qmax = 2 ** (num_bits - 1) - 1
+    row_max = np.abs(tensor).max(axis=1, keepdims=True)
+    scale = row_max / qmax
+    quantized = np.clip(np.round(tensor / scale), -qmax, qmax).astype(np.int8)
+    return quantized, scale
+
+
+def dequantize_tensor_per_row(quantized: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """
+    Same idea as dequantize_tensor, but scale is now (num_rows, 1) instead
+    of a single float - it broadcasts against each row of quantized
+    automatically.
+
+    Returns: float32 array, same shape as quantized.
+    """
+    return quantized.astype(np.float32) * scale
+
+
+def quantize_weights_per_row(weights: dict, num_bits: int) -> dict:
+    """
+    Same as quantize_weights, but using quantize_tensor_per_row /
+    dequantize_tensor_per_row instead of the per-tensor versions.
+
+    weights: dict[str, np.ndarray]
+    num_bits: 8 or 4
+    Returns: a NEW dict[str, np.ndarray], same keys as weights.
+    """
+    result = {}
+    for name, tensor in weights.items():
+        if tensor.ndim == 2:
+            quantized, scale = quantize_tensor_per_row(tensor, num_bits)
+            result[name] = dequantize_tensor_per_row(quantized, scale)
         else:
             result[name] = tensor
     return result

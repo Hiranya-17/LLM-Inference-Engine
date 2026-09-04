@@ -23,7 +23,15 @@ import pytest
 from src.safetensors_reader import read_header, load_tensor
 from src.bpe_tokenizer import load_byte_to_unicode, load_tokenizer_data, encode as bpe_encode
 from src.forward_pass import CONFIG
-from src.quantization import quantize_tensor, dequantize_tensor, quantize_weights, compute_perplexity
+from src.quantization import (
+    quantize_tensor,
+    dequantize_tensor,
+    quantize_weights,
+    quantize_tensor_per_row,
+    dequantize_tensor_per_row,
+    quantize_weights_per_row,
+    compute_perplexity,
+)
 from bench.benchmark import record
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen2.5-0.5B-Instruct")
@@ -84,6 +92,62 @@ def test_quantize_weights_leaves_1d_tensors_unchanged():
     assert not np.array_equal(result["some.linear.weight"], weights["some.linear.weight"])
 
 
+# --- Part 1b: per-row quantize_tensor / dequantize_tensor math ---
+
+@pytest.mark.parametrize("num_bits,qmax", [(8, 127), (4, 7)])
+def test_per_row_max_magnitude_element_maps_to_qmax(num_bits, qmax):
+    # a controlled (not random) tensor so each row's max is known exactly
+    tensor = np.full((10, 16), 0.1, dtype=np.float32)
+    tensor[2, 5] = 10.0    # row 2's outlier
+    tensor[7, 9] = 1.0     # row 7's own (much smaller) max
+    quantized, scale = quantize_tensor_per_row(tensor, num_bits)
+
+    assert quantized[2, 5] == qmax
+    assert scale[2, 0] == pytest.approx(10.0 / qmax, rel=1e-6)
+    # row 7's scale is set by ITS OWN max, unaffected by row 2's outlier
+    assert quantized[7, 9] == qmax
+    assert scale[7, 0] == pytest.approx(1.0 / qmax, rel=1e-6)
+
+
+@pytest.mark.parametrize("num_bits", [8, 4])
+def test_per_row_dequantized_error_bounded_by_half_row_scale(num_bits):
+    rng = np.random.default_rng(5)
+    tensor = rng.standard_normal((16, 16)).astype(np.float32) * 5
+    quantized, scale = quantize_tensor_per_row(tensor, num_bits)
+    dequantized = dequantize_tensor_per_row(quantized, scale)
+
+    max_error_per_row = np.abs(tensor - dequantized).max(axis=1, keepdims=True)
+    assert np.all(max_error_per_row <= scale / 2 + 1e-4)
+
+
+def test_per_row_outlier_does_not_hurt_other_rows():
+    """The whole point of per-row: one row's outlier shouldn't blow up the
+    quantization error in a DIFFERENT row - unlike per-tensor, where every
+    row shares one scale set by the global max."""
+    tensor = np.ones((4, 8), dtype=np.float32)
+    tensor[0, 0] = 1000.0   # a huge outlier, but only in row 0
+
+    _, scale_per_tensor = quantize_tensor(tensor, num_bits=4)
+    _, scale_per_row = quantize_tensor_per_row(tensor, num_bits=4)
+
+    # per-tensor: EVERY row is stuck with the scale set by the row-0 outlier
+    assert scale_per_tensor == pytest.approx(1000.0 / 7, rel=1e-6)
+    # per-row: row 3 (no outlier) gets its own tight scale instead
+    assert scale_per_row[3, 0] == pytest.approx(1.0 / 7, rel=1e-6)
+    assert scale_per_row[3, 0] < scale_per_tensor
+
+
+def test_quantize_weights_per_row_leaves_1d_tensors_unchanged():
+    weights = {
+        "some.norm.weight": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        "some.linear.weight": np.random.default_rng(6).standard_normal((8, 8)).astype(np.float32),
+    }
+    result = quantize_weights_per_row(weights, num_bits=8)
+
+    np.testing.assert_array_equal(result["some.norm.weight"], weights["some.norm.weight"])
+    assert result["some.linear.weight"].shape == (8, 8)
+
+
 # --- Part 2: real model, perplexity at each precision level ---
 
 @pytest.fixture(scope="module")
@@ -108,7 +172,7 @@ def test_perplexity_across_precision_levels(weights, token_ids):
     int4_weights = quantize_weights(weights, num_bits=4)
     int4_ppl = compute_perplexity(token_ids, int4_weights, CONFIG)
 
-    print(f"\nperplexity on {len(token_ids)} tokens:")
+    print(f"\nperplexity on {len(token_ids)} tokens (per-tensor):")
     print(f"  fp32: {fp32_ppl:.3f}")
     print(f"  int8: {int8_ppl:.3f}")
     print(f"  int4: {int4_ppl:.3f}")
@@ -121,3 +185,30 @@ def test_perplexity_across_precision_levels(weights, token_ids):
     })
 
     assert np.isfinite(fp32_ppl) and np.isfinite(int8_ppl) and np.isfinite(int4_ppl)
+
+
+def test_perplexity_across_precision_levels_per_row(weights, token_ids):
+    fp32_ppl = compute_perplexity(token_ids, weights, CONFIG)
+
+    int8_weights = quantize_weights_per_row(weights, num_bits=8)
+    int8_ppl = compute_perplexity(token_ids, int8_weights, CONFIG)
+
+    int4_weights = quantize_weights_per_row(weights, num_bits=4)
+    int4_ppl = compute_perplexity(token_ids, int4_weights, CONFIG)
+
+    print(f"\nperplexity on {len(token_ids)} tokens (per-row):")
+    print(f"  fp32: {fp32_ppl:.3f}")
+    print(f"  int8: {int8_ppl:.3f}")
+    print(f"  int4: {int4_ppl:.3f}")
+
+    record(phase="phase6_quantization", tokens=len(token_ids), elapsed_s=0.0, extra={
+        "fp32_perplexity": round(fp32_ppl, 3),
+        "int8_perplexity": round(int8_ppl, 3),
+        "int4_perplexity": round(int4_ppl, 3),
+        "granularity": "per_row",
+    })
+
+    assert np.isfinite(fp32_ppl) and np.isfinite(int8_ppl) and np.isfinite(int4_ppl)
+    # the whole point of per-row: INT4 should no longer be catastrophically
+    # broken the way it was under per-tensor quantization.
+    assert int4_ppl < 1000

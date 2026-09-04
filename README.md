@@ -23,7 +23,7 @@ Each phase is built and independently verified for correctness before the next o
 - [x] Phase 3 — Naive forward pass
 - [x] Phase 4 — KV cache
 - [x] Phase 5 — Sampling
-- [x] Phase 6 — Quantization (per-tensor)
+- [x] Phase 6 — Quantization (per-tensor and per-row)
 
 ### Phase 1: Safetensors parsing
 
@@ -57,7 +57,7 @@ Verified in [`tests/test_phase4_kv_cache.py`](tests/test_phase4_kv_cache.py) aga
 
 Verified in [`tests/test_phase5_sampling.py`](tests/test_phase5_sampling.py): `apply_temperature`, `top_k_filter`, and `top_p_filter` are each checked against `transformers`' own `TemperatureLogitsWarper`/`TopKLogitsWarper`/`TopPLogitsWarper` classes (used strictly as a reference oracle, never imported by the actual implementation) across multiple parameter values. `softmax` is checked against `torch.softmax`. Since the actual random draw can't be checked against a reference the same way (independent RNGs draw different random numbers even from identical probabilities), `sample()` is instead verified statistically — 100,000 draws from a known 5-element distribution match the expected probabilities within `0.01` — and for reproducibility: the same seed produces the exact same sequence of draws, and `top_k=1` always agrees with greedy argmax regardless of seed.
 
-### Phase 6: Quantization (per-tensor)
+### Phase 6: Quantization
 
 [`src/quantization.py`](src/quantization.py) implements affine (symmetric, per-tensor) INT8 and INT4 quantization: for each 2D weight matrix, one scale factor (`max(abs(tensor)) / qmax`) is computed for the *entire tensor*, every value is rounded to the nearest representable integer and clipped to range, then immediately dequantized back to float32 ("fake quantization" — this measures accuracy impact, not memory savings; a real deployment would keep the integers packed and use dedicated low-bit matmul kernels, which is out of scope here). RMSNorm weights (1D) are left untouched.
 
@@ -71,7 +71,17 @@ Verified in [`tests/test_phase6_quantization.py`](tests/test_phase6_quantization
 | INT8 | 10.4 |
 | INT4 | ~5.5 × 10^8 |
 
-INT8 barely hurts (127 representable levels per tensor is plenty of resolution). INT4 per-tensor doesn't just degrade the model, it destroys it. The reason: **one scale factor has to cover an entire weight matrix.** If even a single weight in that matrix is a large outlier, the scale stretches to accommodate it — and with only 7 representable levels on each side of zero, every other (normal-sized) weight in that tensor gets crushed toward zero. One outlier wrecks the whole tensor. This is a well-known real failure mode of naive per-tensor quantization, not a bug in this implementation — and it's the direct motivation for per-row quantization (a separate scale per row, so one outlier only damages its own row), which is the next iteration of this phase.
+INT8 barely hurts (127 representable levels per tensor is plenty of resolution). INT4 per-tensor doesn't just degrade the model, it destroys it. The reason: **one scale factor has to cover an entire weight matrix.** If even a single weight in that matrix is a large outlier, the scale stretches to accommodate it — and with only 7 representable levels on each side of zero, every other (normal-sized) weight in that tensor gets crushed toward zero. One outlier wrecks the whole tensor. This is a well-known real failure mode of naive per-tensor quantization, not a bug in this implementation.
+
+**Fixing it with per-row quantization:** `quantize_tensor_per_row` / `dequantize_tensor_per_row` / `quantize_weights_per_row` compute one scale *per row* of each weight matrix instead of one scale for the whole thing — each row is one output neuron, so an outlier in one row only stretches that row's own scale, leaving every other row's precision untouched.
+
+| precision | per-tensor | per-row |
+|---|---|---|
+| fp32 | 9.9 | 9.9 |
+| INT8 | 10.4 | 9.97 |
+| INT4 | ~5.5 × 10^8 (model broken) | 27.6 (degraded, but functional) |
+
+Per-row doesn't just help — it rescues INT4 from total breakage into a model that's clearly worse but still coherent, and makes INT8 nearly indistinguishable from full float32 precision. This matches why virtually every real-world quantization library (GPTQ, AWQ, bitsandbytes, etc.) uses per-channel or per-group scales rather than a single scale per tensor — this project reproduces that exact result from scratch rather than taking it on faith.
 
 ## Setup
 
